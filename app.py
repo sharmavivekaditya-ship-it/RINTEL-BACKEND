@@ -13,7 +13,8 @@ Endpoints
 Auth: every /api/* call must send header  X-API-Key: <RINTEL_API_KEY>
 CORS: locked to ALLOWED_ORIGIN (your Lovable app URL).
 """
-import os, json
+import os, json, re, tempfile
+import pdfplumber
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -136,6 +137,83 @@ def api_score_upload():
                               "Use structured transactions or the Account Aggregator flow."), 501
     except NormalizationError as e:
         return jsonify(error=f"normalization failed: {e}"), 422
+
+# ---- Axis bank PDF parser ----
+date_pat = re.compile(r'^\d{2}-\d{2}-\d{4}')
+
+def parse_axis(pdf_path: str):
+    """Parse an Axis Bank statement PDF and return a list of transaction dicts
+    in the engine schema: date (YYYY-MM-DD), description, amount (+credit/-debit)."""
+    txns = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            for table in (page.extract_tables() or []):
+                for row in table:
+                    if not row:
+                        continue
+                    # Axis statement rows: Date | Description | Debit | Credit | Balance
+                    # Skip header rows (first cell doesn't look like a date)
+                    date_cell = (row[0] or "").strip()
+                    if not date_pat.match(date_cell):
+                        continue
+                    try:
+                        # Parse date from DD-MM-YYYY -> YYYY-MM-DD
+                        day, month, year = date_cell.split("-")
+                        date_iso = f"{year}-{month}-{day}"
+                        description = (row[1] or "").strip()
+                        # Debit and credit columns may contain commas or be empty
+                        def _amount(cell):
+                            val = (cell or "").replace(",", "").strip()
+                            return float(val) if val else 0.0
+                        debit  = _amount(row[2]) if len(row) > 2 else 0.0
+                        credit = _amount(row[3]) if len(row) > 3 else 0.0
+                        balance_raw = (row[4] or "").replace(",", "").strip() if len(row) > 4 else ""
+                        # Skip rows where both debit and credit are zero
+                        if debit == 0.0 and credit == 0.0:
+                            continue
+                        # Positive amount = credit (money in), negative = debit (money out)
+                        amount = credit - debit
+                        txn = {"date": date_iso, "description": description, "amount": amount}
+                        if balance_raw:
+                            try:
+                                txn["balance"] = float(balance_raw)
+                            except ValueError:
+                                pass
+                        txns.append(txn)
+                    except (ValueError, IndexError):
+                        continue
+    return txns
+
+
+@app.post("/api/score-pdf")
+def api_score_pdf():
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != API_KEY:
+        return jsonify(error="unauthorized"), 401
+    if "file" not in request.files:
+        return jsonify(error="no file uploaded"), 400
+    uploaded = request.files["file"]
+    tmp_path = None
+    try:
+        # Save upload to a temp file so pdfplumber can open it by path
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+            uploaded.save(tmp_path)
+        txns = parse_axis(tmp_path)
+        if len(txns) < 5:
+            return jsonify(
+                error="too_few_transactions",
+                detail=f"Only {len(txns)} transaction(s) parsed from the PDF; need at least 5."
+            ), 422
+        result = score(txns)
+        return jsonify(serialize(result))
+    except Exception as e:
+        app.logger.exception("score-pdf error")
+        return jsonify(error="pdf_scoring_failed", detail=str(e)), 500
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
