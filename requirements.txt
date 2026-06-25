@@ -1,0 +1,4 @@
+Flask==3.0.3
+flask-cors==4.0.1
+gunicorn==22.0.0
+# pdfplumber==0.11.4   # uncomment when the Task-2 parser is built
