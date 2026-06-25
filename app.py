@@ -75,15 +75,128 @@ def humanize(rc):
         return SIGNED[code][0] if sign == "+" else SIGNED[code][1]
     return FRIENDLY.get(code, rc.get("text","").split(":")[0])
 
-def serialize(result):
+def _build_cashflow(transactions):
+    """Compute the cashflow analytics block from a normalised transaction list."""
+    from collections import defaultdict
+
+    if not transactions:
+        return {
+            "months": [], "totalInflow": 0.0, "totalOutflow": 0.0, "net": 0.0,
+            "avgInflow": 0.0, "avgOutflow": 0.0, "avgNet": 0.0,
+            "monthsCovered": 0, "txCount": 0,
+            "spendCategories": [], "inflowCategories": [],
+            "biggestInflow": None, "biggestOutflow": None,
+        }
+
+    # ---- per-month buckets ----
+    month_inflow  = defaultdict(float)
+    month_outflow = defaultdict(float)
+    month_count   = defaultdict(int)
+
+    # ---- category buckets ----
+    spend_cat   = defaultdict(lambda: {"amount": 0.0, "count": 0})
+    inflow_cat  = defaultdict(lambda: {"amount": 0.0, "count": 0})
+
+    biggest_inflow  = None   # {"description", "amount", "date"}
+    biggest_outflow = None   # most negative
+
+    MONTH_ABBR = ["Jan","Feb","Mar","Apr","May","Jun",
+                  "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    for t in transactions:
+        ym = t["date"][:7]          # "YYYY-MM"
+        amt = t["amount"]
+        desc = t.get("description") or t.get("counterparty") or ""
+        cat  = t.get("category", "other")
+
+        month_count[ym] += 1
+
+        if amt > 0:
+            month_inflow[ym]  += amt
+            inflow_cat[cat]["amount"] += amt
+            inflow_cat[cat]["count"]  += 1
+            if biggest_inflow is None or amt > biggest_inflow["amount"]:
+                biggest_inflow = {"description": desc, "amount": amt, "date": t["date"]}
+        else:
+            month_outflow[ym] += abs(amt)
+            spend_cat[cat]["amount"] += abs(amt)
+            spend_cat[cat]["count"]  += 1
+            if biggest_outflow is None or amt < biggest_outflow["_raw"]:
+                biggest_outflow = {"description": desc, "amount": abs(amt),
+                                   "date": t["date"], "_raw": amt}
+
+    # ---- build sorted months list ----
+    all_months = sorted(set(list(month_inflow.keys()) +
+                            list(month_outflow.keys()) +
+                            list(month_count.keys())))
+    months_out = []
+    for ym in all_months:
+        y, m = int(ym[:4]), int(ym[5:7])
+        label = f"{MONTH_ABBR[m-1]} {str(y)[2:]}"
+        inf  = round(month_inflow.get(ym, 0.0), 2)
+        outf = round(month_outflow.get(ym, 0.0), 2)
+        months_out.append({
+            "month":   ym,
+            "label":   label,
+            "inflow":  inf,
+            "outflow": outf,
+            "net":     round(inf - outf, 2),
+            "count":   month_count.get(ym, 0),
+        })
+
+    n = len(months_out)
+    total_inflow  = round(sum(r["inflow"]  for r in months_out), 2)
+    total_outflow = round(sum(r["outflow"] for r in months_out), 2)
+    net           = round(total_inflow - total_outflow, 2)
+    avg_inflow    = round(total_inflow  / n, 2) if n else 0.0
+    avg_outflow   = round(total_outflow / n, 2) if n else 0.0
+    avg_net       = round(net / n, 2) if n else 0.0
+
+    # ---- category arrays ----
+    spend_list = sorted(
+        [{"category": k, "amount": round(v["amount"], 2), "count": v["count"]}
+         for k, v in spend_cat.items()],
+        key=lambda x: x["amount"], reverse=True
+    )
+    inflow_list = sorted(
+        [{"category": k, "amount": round(v["amount"], 2), "count": v["count"]}
+         for k, v in inflow_cat.items()],
+        key=lambda x: x["amount"], reverse=True
+    )
+
+    # strip internal _raw sentinel
+    if biggest_outflow and "_raw" in biggest_outflow:
+        del biggest_outflow["_raw"]
+
+    return {
+        "months":          months_out,
+        "totalInflow":     total_inflow,
+        "totalOutflow":    total_outflow,
+        "net":             net,
+        "avgInflow":       avg_inflow,
+        "avgOutflow":      avg_outflow,
+        "avgNet":          avg_net,
+        "monthsCovered":   n,
+        "txCount":         len(transactions),
+        "spendCategories": spend_list,
+        "inflowCategories": inflow_list,
+        "biggestInflow":   biggest_inflow,
+        "biggestOutflow":  biggest_outflow,
+    }
+
+
+def serialize(result, transactions=None):
     pillars = {PILLAR_LABEL[k]: round(v) for k, v in result.pillars.items()}
     strengths = [humanize(rc) for rc in result.reason_codes if rc["sign"] == "+"][:4]
     improve   = [humanize(rc) for rc in result.reason_codes if rc["sign"] == "-"][:4]
     weak = sorted(result.pillars.items(), key=lambda kv: kv[1])[:2]
     tips = [TIPS[k] for k, _ in weak]
-    return {"score": result.score, "tier": result.tier, "confidence": result.confidence,
-            "archetype": result.archetype.title().replace("_", " "),
-            "pillars": pillars, "strengths": strengths, "improve": improve, "tips": tips}
+    out = {"score": result.score, "tier": result.tier, "confidence": result.confidence,
+           "archetype": result.archetype.title().replace("_", " "),
+           "pillars": pillars, "strengths": strengths, "improve": improve, "tips": tips}
+    if transactions is not None:
+        out["cashflow"] = _build_cashflow(transactions)
+    return out
 
 def require_key():
     return request.headers.get("X-API-Key") == API_KEY
@@ -128,7 +241,7 @@ def api_score_upload():
     try:
         raw = parse_pdf(request.files["file"].read())   # <-- Ritam's Task-2 parser drops in here
         txns = normalize_transactions(raw)
-        return jsonify(serialize(score(txns)))
+        return jsonify(serialize(score(txns), txns))
     except NotImplementedError:
         # Honest until the parser exists. The AA route is the real production path.
         return jsonify(error="pdf_parsing_not_available",
